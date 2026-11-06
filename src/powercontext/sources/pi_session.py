@@ -59,7 +59,7 @@ def _event_source_id(session_id: str, event_id: str) -> str:
         # No truncation of either identity component: a bounded stable digest
         # distinguishes long IDs without introducing delimiter collisions.
         identity = json.dumps([session_id, event_id], ensure_ascii=False, separators=(",", ":"))
-        source_id = "pi:sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        source_id = "pi:!sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return source_id
 
 
@@ -101,7 +101,7 @@ def _parse_archive(value: PiSessionInput) -> _PiArchive:
 
     entries: list[dict[str, JsonValue]] = []
     try:
-        for line in text.splitlines():
+        for line in text.split("\n"):
             if not line.strip():
                 continue
             parsed = json.loads(line, parse_constant=_reject_json_constant)
