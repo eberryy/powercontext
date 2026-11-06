@@ -133,7 +133,7 @@ def _parse_archive(value: PiSessionInput) -> _PiArchive:
         if "parentId" not in record:
             raise ValueError(f"Pi entry {event_id} is missing parentId")
         parent_id = record["parentId"]
-        if parent_id is not None and (not isinstance(parent_id, str) or parent_id not in nodes):
+        if parent_id not in (None, "") and (not isinstance(parent_id, str) or parent_id not in nodes):
             raise ValueError(f"Pi entry {event_id} has a missing, forward, or cyclic parent")
         nodes[event_id] = record
         order.append(event_id)
@@ -158,7 +158,7 @@ def _selected_records(archive: _PiArchive, leaf_id: str | None) -> tuple[dict[st
         seen.add(current)
         record = archive.nodes[current]
         path.append(record)
-        current = record["parentId"]  # Validated as a prior ID or None.
+        current = record["parentId"] or None  # Validated as a prior ID or an empty root.
     path.reverse()
     return tuple(path)
 
@@ -201,10 +201,14 @@ def _event_from_record(session_id: str, record: dict[str, JsonValue]) -> PiEvent
         role = message_role
         if role == "toolResult":
             text = _visible_blocks(message.get("content"))
+            if not text.strip():
+                return None
             body = f"[tool_result {message.get('toolName', '')} {message.get('toolCallId', '')}] {text}"
         elif role == "bashExecution":
             command = message.get("command", "")
             output = message.get("output", "")
+            if not command and not output:
+                return None
             body = f"$ {command}\n{output}"
         else:
             body = _visible_blocks(message.get("content"))
