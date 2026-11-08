@@ -808,6 +808,7 @@ class ArtifactProcessingSupervisor:
             return
         admitted: list[str] = []
         page_limit = min(capacity, _DISCOVERY_PAGE_SIZE)
+        scan_after = state.count_after
         async with self._database.transaction() as connection:
             await self._leases.require_fence(connection, self._require_current_fence())
             rows = await self._intents.scan(
@@ -819,7 +820,7 @@ class ArtifactProcessingSupervisor:
             )
             cursors = SourceCursorRepository()
             for row in rows:
-                state.count_after = row.pending_sequence
+                scan_after = row.pending_sequence
                 scope = row.scope_id
                 if (
                     scope in state.queued
@@ -841,9 +842,10 @@ class ArtifactProcessingSupervisor:
                 # Failed workers keep requested > handled; a restart rediscovers them.
                 await self._intents.request(connection, scope, state.binding.binding_name)
                 admitted.append(scope)
-        if len(rows) < page_limit:
-            state.count_after = 0
-        else:
+        # Publish the page cursor only after requests committed. A failed
+        # admission must be retried from the previously committed scan point.
+        state.count_after = scan_after if len(rows) == page_limit else 0
+        if len(rows) == page_limit:
             state.next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
         for scope in admitted:
             self._enqueue(state, scope)
