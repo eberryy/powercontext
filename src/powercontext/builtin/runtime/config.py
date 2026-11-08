@@ -20,7 +20,8 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal, Self
 
-from pydantic import StrictInt, (
+from pydantic import (
+    StrictInt,
     AnyHttpUrl,
     BaseModel,
     ConfigDict,
