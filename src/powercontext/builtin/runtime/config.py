@@ -20,7 +20,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal, Self
 
-from pydantic import (
+from pydantic import StrictInt, (
     AnyHttpUrl,
     BaseModel,
     ConfigDict,
@@ -137,6 +137,10 @@ class RuntimeConfig(BaseModel):
 
     scope_cache_size: int = Field(default=DEFAULT_SCOPE_CACHE_SIZE, ge=1)
     source_window_limit: int = Field(default=100, ge=1)
+    # Optional per-Scope journal-count admission gates, independent of window size.
+    # StrictInt rejects strings, booleans, and float coercion; gt=0 rejects zero.
+    memory_source_count_threshold: StrictInt | None = Field(default=None, gt=0)
+    topic_memory_source_count_threshold: StrictInt | None = Field(default=None, gt=0)
     context_assembly_max_entries: int = Field(default=8, ge=1)
     memory_extraction_profile: MemoryExtractionProfile = MemoryExtractionProfile.CODING
     memory_rerank_enabled: bool = False
