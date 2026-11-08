@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -71,6 +76,7 @@ from powercontext.builtin.runtime.protocols import RuntimeTracing
 
 logger = logging.getLogger(__name__)
 _OCEANBASE_TICK_SECONDS = 1.0
+_COUNT_TRIGGER_POLL_SECONDS = 0.5
 _OCEANBASE_LEASE_SECONDS = 15.0
 _RETRY_BASE_SECONDS = 30.0
 _RETRY_CAP_SECONDS = 1800.0
@@ -110,6 +116,7 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -129,6 +136,10 @@ class ArtifactProcessingBinding:
         object.__setattr__(self, "config_prefix", prefix)
         if type(self.max_workers) is not int or self.max_workers < 1:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold <= 0
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
@@ -392,6 +403,7 @@ class _FamilyState:
     running: dict[str, _RunningWorker] = field(default_factory=dict)
     retries: dict[str, _RetryState] = field(default_factory=dict)
     requested_after: int = 0
+    count_after: int = 0
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
@@ -656,6 +668,7 @@ class ArtifactProcessingSupervisor:
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+        await self._discover_count(state)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -779,6 +792,59 @@ class ArtifactProcessingSupervisor:
         state.scan_in_progress = scan_in_progress
         state.next_schedule_at = next_schedule_at
         state.next_discovery_at = next_discovery_at
+        for scope in admitted:
+            self._enqueue(state, scope)
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        """Admit Source-driven work only when this Family's durable backlog reaches N.
+
+        Journal positions, not dirty-generation increments or generated evidence,
+        measure the backlog. This leaves already accepted invocations and retries
+        to the normal requested-work discovery and reaper paths.
+        """
+        threshold = state.binding.source_count_threshold
+        capacity = self._fresh_capacity(state)
+        if threshold is None or capacity <= 0:
+            return
+        admitted: list[str] = []
+        page_limit = min(capacity, _DISCOVERY_PAGE_SIZE)
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            rows = await self._intents.scan(
+                connection,
+                state.binding.binding_name,
+                after_sequence=state.count_after,
+                limit=page_limit,
+                dirty_only=True,
+            )
+            cursors = SourceCursorRepository()
+            for row in rows:
+                state.count_after = row.pending_sequence
+                scope = row.scope_id
+                if (
+                    scope in state.queued
+                    or scope in state.running
+                    or scope in state.retries
+                    or row.requested_generation > row.handled_generation
+                ):
+                    continue
+                high = await connection.scalar(
+                    select(SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+                        SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == scope
+                    )
+                )
+                saved = await cursors.load(connection, scope, state.binding.binding_name)
+                after = 0 if saved is None else saved.cursor.sequence
+                if int(high or 0) - after < threshold:
+                    continue
+                # Request and journal are durable independently of this process.
+                # Failed workers keep requested > handled; a restart rediscovers them.
+                await self._intents.request(connection, scope, state.binding.binding_name)
+                admitted.append(scope)
+        if len(rows) < page_limit:
+            state.count_after = 0
+        else:
+            state.next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
         for scope in admitted:
             self._enqueue(state, scope)
 
@@ -1057,7 +1123,7 @@ class ArtifactProcessingSupervisor:
             state.retry_queued.clear()
             state.overflow_not_before = 0.0
             state.retries.clear()
-            state.requested_after = state.scan_after = state.scan_generation = 0
+            state.requested_after = state.count_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
             state.discovery_pending = True
 
@@ -1093,6 +1159,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.source_count_threshold is not None:
+                deadlines.append(now + _COUNT_TRIGGER_POLL_SECONDS)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
